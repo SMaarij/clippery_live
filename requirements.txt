@@ -1,0 +1,5 @@
+streamlink>=7.0
+faster-whisper
+requests
+supabase>=2.20
+boto3
