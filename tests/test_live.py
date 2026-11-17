@@ -10,6 +10,7 @@ quiet baseline and one burst of reactions. It checks that exactly one clip is cu
 needs no API key or speech model.
 """
 import json
+from unittest import mock
 import os
 import subprocess
 import sys
@@ -179,6 +180,42 @@ def test_describe():
     check("chat around the moment is collected, most repeated first", near[0] == "LUL (x2)" and "old message" not in near, near)
 
 
+def test_youtube():
+    from live import platforms, tunnel
+    from live.youtube_chat import parse_actions, _continuation
+    check("YouTube stream URLs for handles, channel ids and video ids",
+          platforms.stream_url("youtube", "@CaseOh") == "https://www.youtube.com/@CaseOh/live"
+          and platforms.stream_url("youtube", "UC" + "a" * 22) == "https://www.youtube.com/channel/UC" + "a" * 22 + "/live"
+          and platforms.stream_url("youtube", "v=dQw4w9WgXcQ") == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+          and platforms.stream_url("twitch", "summit1g") == "https://www.twitch.tv/summit1g")
+    with mock.patch.dict(os.environ, {"WARP_SOCKS": "socks5h://127.0.0.1:1080"}):
+        check("only YouTube goes through the tunnel", platforms.proxy("youtube") and platforms.proxy("twitch") is None)
+    check("a YouTube bot refusal is recognised", tunnel.looks_blocked("ERROR: Sign in to confirm you're not a bot")
+          and not tunnel.looks_blocked("error: No playable streams found"))
+    actions = [{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {
+                    "message": {"runs": [{"text": "NO WAY "}, {"emoji": {"shortcuts": [":fire:"]}}]},
+                    "authorName": {"simpleText": "@Viewer1"}, "timestampUsec": "1700000000000000"}}}},
+               {"addChatItemAction": {"item": {"liveChatViewerEngagementMessageRenderer": {}}}},
+               {"markChatItemAsDeletedAction": {}}]
+    msgs = parse_actions(actions)
+    check("YouTube chat messages are parsed (text + emoji, author, server time), other items skipped",
+          len(msgs) == 1 and msgs[0].text == "NO WAY :fire:" and msgs[0].user == "viewer1" and msgs[0].ts == 1700000000.0, msgs)
+    check("YouTube chat continuation token and wait are read",
+          _continuation([{"invalidationContinuationData": {"continuation": "abc", "timeoutMs": 10000}}]) == ("abc", 10000))
+    import live.watcher as wmod
+    st = type("S", (), {"watch_id": "t"})()
+    w1 = wmod.Watcher(store=st, channel="UCAbCdEfGhIjKlMnOpQrStUv", settings={}, max_hours=1, workdir=".", platform="youtube")
+    w2 = wmod.Watcher(store=st, channel="@CaseOh", settings={}, max_hours=1, workdir=".", platform="youtube")
+    w3 = wmod.Watcher(store=st, channel="Summit1G", settings={}, max_hours=1, workdir=".")
+    check("YouTube ids keep their case, handles and Twitch names are lowercased; viewer clips are Twitch-only",
+          w1.channel == "UCAbCdEfGhIjKlMnOpQrStUv" and w2.channel == "@caseoh" and w3.channel == "summit1g"
+          and not w1.viewer.enabled, (w1.channel, w2.channel, w3.channel))
+    with mock.patch.dict(os.environ, {"GROQ_API_KEY": ""}):
+        from live import describe as d
+        fb = d.describe("He did it!", [], "CaseOh", "", platform="YouTube")
+    check("YouTube clips get #youtube in the fallback hashtags", "#youtube" in fb["description"], fb)
+
+
 def offline_run():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
@@ -278,6 +315,7 @@ def main():
     test_stack_geometry()
     test_buffer_prune()
     test_describe()
+    test_youtube()
     if "--quick" not in sys.argv:
         offline_run()
         offline_handoff()

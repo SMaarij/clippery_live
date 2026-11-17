@@ -1,7 +1,10 @@
 """
 Records a live stream into the rolling buffer.
 
-    streamlink --stdout twitch.tv/<channel> best  |  ffmpeg -c copy -f segment ...  ->  seg_0000001.ts, segments.csv
+    streamlink --stdout <stream url> best  |  ffmpeg -c copy -f segment ...  ->  seg_0000001.ts, segments.csv
+
+Twitch or YouTube (live/platforms.py). YouTube goes through the WARP SOCKS proxy (--http-proxy) because it refuses
+GitHub's datacenter addresses.
 
 streamlink fetches the HLS stream and skips Twitch's mid-roll ads (--twitch-disable-ads, so ad breaks never end up
 in a clip). ffmpeg only copies packets into 4-second segments; nothing is re-encoded until a clip is cut.
@@ -18,6 +21,7 @@ import threading
 import time
 
 from .buffer import SegmentBuffer
+from .platforms import proxy as platform_proxy, stream_url
 
 
 def streamlink_cmd() -> list[str]:
@@ -25,21 +29,33 @@ def streamlink_cmd() -> list[str]:
     return [exe] if exe else [sys.executable, "-m", "streamlink"]
 
 
-def is_live(channel: str, timeout: float = 45) -> bool:
+def is_live(channel: str, timeout: float = 45, platform: str = "twitch") -> bool:
     """True when the channel is broadcasting right now (asks streamlink for its stream list)."""
+    ok, _ = live_check(channel, timeout, platform)
+    return ok
+
+
+def live_check(channel: str, timeout: float = 45, platform: str = "twitch") -> tuple[bool, str]:
+    """(is live, streamlink's own output) so a caller can tell 'not live' from 'YouTube blocked us'."""
+    cmd = streamlink_cmd() + ["--json"]
+    px = platform_proxy(platform)
+    if px:
+        cmd += ["--http-proxy", px]
     try:
-        r = subprocess.run(streamlink_cmd() + ["--json", f"https://www.twitch.tv/{channel}"],
-                           capture_output=True, text=True, timeout=timeout)
-    except Exception:
-        return False
-    return r.returncode == 0 and '"streams"' in r.stdout and '"best"' in r.stdout
+        r = subprocess.run(cmd + [stream_url(platform, channel)], capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return False, str(e)
+    out = (r.stdout or "") + (r.stderr or "")
+    return (r.returncode == 0 and '"streams"' in r.stdout and '"best"' in r.stdout), out[-600:]
 
 
 class Recorder:
     def __init__(self, buffer: SegmentBuffer, channel: str | None = None, quality: str = "best",
-                 source_file: str | None = None, segment_sec: float = 4.0, ffmpeg: str = "ffmpeg", log=print):
+                 source_file: str | None = None, segment_sec: float = 4.0, ffmpeg: str = "ffmpeg", log=print,
+                 platform: str = "twitch"):
         self.buffer = buffer
         self.channel = channel
+        self.platform = platform
         self.quality = quality
         self.source_file = source_file
         self.segment_sec = segment_sec
@@ -56,9 +72,14 @@ class Recorder:
             cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-re", "-i", self.source_file,
                    "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "pipe:1"]
         else:
-            cmd = streamlink_cmd() + ["--stdout", "--loglevel", "warning", "--twitch-disable-ads", "--twitch-low-latency",
-                                      "--hls-live-edge", "2", "--stream-segment-attempts", "5", "--retry-open", "3",
-                                      f"https://www.twitch.tv/{self.channel}", self.quality]
+            cmd = streamlink_cmd() + ["--stdout", "--loglevel", "warning", "--hls-live-edge", "2",
+                                      "--stream-segment-attempts", "5", "--retry-open", "3"]
+            if self.platform == "twitch":
+                cmd += ["--twitch-disable-ads", "--twitch-low-latency"]
+            px = platform_proxy(self.platform)
+            if px:
+                cmd += ["--http-proxy", px]
+            cmd += [stream_url(self.platform, self.channel), self.quality]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def start(self):

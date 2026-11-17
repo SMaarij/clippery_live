@@ -1,5 +1,5 @@
 """
-Follows one live channel and clips its moments.
+Follows one live channel (Twitch or YouTube) and clips its moments.
 
     python -m live.watcher --watch <watch_id>                         # from the admin panel / GitHub Actions
     python -m live.watcher --channel somechannel --local clips_out    # no database, clips land in a folder
@@ -34,13 +34,16 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from live.buffer import SegmentBuffer          # noqa: E402
+from live import tunnel                        # noqa: E402
 from live.chat import ChatMessage, TwitchChat  # noqa: E402
 from live.clipper import make_clip             # noqa: E402
 from live.describe import describe             # noqa: E402
 from live.detector import SpikeDetector        # noqa: E402
-from live.recorder import Recorder, is_live    # noqa: E402
+from live.platforms import label as platform_label, proxy as platform_proxy, stream_url, youtube_live_info  # noqa: E402
+from live.recorder import Recorder, live_check  # noqa: E402
 from live.store import DbStore, LocalStore     # noqa: E402
 from live.twitch_api import ViewerClips        # noqa: E402
+from live.youtube_chat import YouTubeChat      # noqa: E402
 
 DEFAULTS = {"sensitivity": "normal", "layout": "center", "facecam": "top-right", "quality": "best",
             "pre": 22, "post": 10, "min_len": 12, "max_len": 60, "wait_minutes": 30, "max_clips": 300,
@@ -75,8 +78,11 @@ def dispatch_next_run(watch_id: str) -> bool:
 class Watcher:
     def __init__(self, store, channel: str, settings: dict, max_hours: float, workdir: str,
                  source_file: str | None = None, chat_replay: str | None = None, handoff_after: float = 5.4 * 3600,
-                 clock=time.time):
-        self.store, self.channel, self.max_hours = store, channel.lower(), float(max_hours)
+                 clock=time.time, platform: str = "twitch"):
+        self.platform = platform if platform in ("twitch", "youtube") else "twitch"
+        # YouTube channel ids and video ids are case-sensitive; Twitch names and YouTube handles are not
+        self.channel = channel.lower() if self.platform == "twitch" or channel.startswith("@") else channel
+        self.store, self.max_hours = store, float(max_hours)
         self.settings = {**DEFAULTS, **(settings or {})}
         self.workdir, self.source_file, self.chat_replay = workdir, source_file, chat_replay
         self.handoff_after = handoff_after
@@ -84,6 +90,11 @@ class Watcher:
         self.run_id = os.environ.get("GITHUB_RUN_ID") or f"{socket.gethostname()}-{os.getpid()}"
         self.detector = SpikeDetector.from_settings(self.settings)
         self.viewer = ViewerClips(self.channel, log=log)
+        if self.platform != "twitch":
+            self.viewer.enabled = False                       # Twitch's viewer-clips API only
+        self.chat = None
+        self.video_id = None
+        self.display_name = self.channel.lstrip("@")           # what the AI captions call the streamer
         self.jobs: queue.Queue = queue.Queue()
         self.made, self.failed, self.n = 0, 0, 0
         self.chat_lock = threading.Lock()
@@ -117,7 +128,37 @@ class Watcher:
         folder = os.path.join(self.workdir, f"buffer{self.session}")
         self.buffer = SegmentBuffer(folder, keep_sec=float(self.settings["buffer_minutes"]) * 60)
         self.recorder = Recorder(self.buffer, channel=self.channel, quality=self.settings["quality"],
-                                 source_file=self.source_file, log=log).start()
+                                 source_file=self.source_file, log=log, platform=self.platform).start()
+
+    def _start_chat(self) -> None:
+        """Twitch IRC, or YouTube's own live-chat feed (through the tunnel). Restarted if the YouTube video changes."""
+        if self.platform == "twitch":
+            if not self.chat:
+                self.chat = TwitchChat(self.channel, self.on_chat, log=log).start()
+            return
+        info = youtube_live_info(stream_url(self.platform, self.channel), platform_proxy(self.platform))
+        vid = info.get("id")
+        if info.get("name"):
+            self.display_name = info["name"]
+        if not vid:
+            log("[ytchat] couldn't find the live video id; chat spikes are off until the stream restarts")
+            return
+        if self.chat and vid == self.video_id:
+            return
+        if self.chat:
+            self.chat.stop()
+        self.video_id = vid
+        self.chat = YouTubeChat(vid, self.on_chat, proxy=platform_proxy(self.platform), log=log)
+        self.chat.start()
+
+    def _is_live(self) -> bool:
+        """Live check; on YouTube a refusal means the tunnel address got blocked, so take a fresh one and ask again."""
+        ok, out = live_check(self.channel, platform=self.platform)
+        if not ok and self.platform == "youtube" and tunnel.looks_blocked(out):
+            log("[tunnel] YouTube refused this address")
+            if tunnel.refresh(log=log):
+                ok, out = live_check(self.channel, platform=self.platform)
+        return ok
 
     # -- clips ---------------------------------------------------------------------------------------------------
     def _clip_worker(self) -> None:
@@ -133,7 +174,8 @@ class Watcher:
                                 stream_ended=recorder.ended.is_set, log=log)
                 when = dt.datetime.utcfromtimestamp(moment).strftime("%H:%M UTC")
                 label = "viewer clip" if trigger == "viewer_clip" else f"chat spike {score}x"
-                text = describe(res.transcript or "", self._chat_near(moment), self.channel, self.note, log=log)
+                text = describe(res.transcript or "", self._chat_near(moment), self.display_name, self.note, log=log,
+                                platform=platform_label(self.platform))
                 title = text.get("title") or f"{self.channel} {when} ({label})"
                 cid = self.store.add_clip(res, moment, trigger, score, title, hook=text.get("hook"),
                                           description=text.get("description"))
@@ -187,7 +229,7 @@ class Watcher:
             if self.store.stop_requested():
                 self.reason = "stopped"
                 return False
-            if is_live(self.channel):
+            if self._is_live():
                 return True
             log(f"[wait] {self.channel} is not live yet")
             time.sleep(60)
@@ -202,6 +244,9 @@ class Watcher:
         hb = [t_start]
         if int(watch.get("generation") or 0) == 0:                # a hand-over run must not overwrite the live run's status
             self.store.update(status="waiting", active_run=self.run_id, error=None)
+        if self.platform == "youtube" and not self.source_file:
+            if not tunnel.ensure(log=log):
+                log("[tunnel] no WARP address YouTube accepts yet; will keep trying while waiting")
         wait_deadline = t_start + float(self.settings["wait_minutes"]) * 60
         if not self._wait_until_live(wait_deadline):
             if int(watch.get("generation") or 0) == 0:
@@ -216,9 +261,8 @@ class Watcher:
         live_since = self.clock()
         if self.chat_replay:
             threading.Thread(target=self._replay_chat, args=(self.chat_replay, live_since), daemon=True).start()
-            chat = None
         else:
-            chat = TwitchChat(self.channel, self.on_chat, log=log).start()
+            self._start_chat()
         if not watch.get("started_at"):
             self.store.update(started_at=dt.datetime.now(dt.timezone.utc).isoformat())
         started_at = watch.get("started_at")
@@ -282,15 +326,20 @@ class Watcher:
                         self.reason = "ended"
                         break
                     log(f"[watch] stream dropped; checking if it comes back ({drop_checks}/3)")
-                    time.sleep(45)
-                    if is_live(self.channel):
+                    if self.platform == "youtube" and tunnel.looks_blocked(self.recorder.exit_detail):
+                        tunnel.refresh(log=log)                # blocked mid-stream: new address, then resume
+                    else:
+                        time.sleep(45)
+                    if self._is_live():
                         self._start_recorder()
+                        if not self.chat_replay:
+                            self._start_chat()
                         drop_checks = 0
                     continue
                 time.sleep(self.detector.tick)
         finally:
-            if chat:
-                chat.stop()
+            if self.chat:
+                self.chat.stop()
             if self.recorder:
                 self.recorder.stop()
             done = self.clock() + 240
@@ -312,7 +361,8 @@ class Watcher:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Clip a live Twitch stream from chat spikes.")
     ap.add_argument("--watch", help="live_watches id (database mode)")
-    ap.add_argument("--channel", help="Twitch channel (local mode)")
+    ap.add_argument("--channel", help="channel (local mode): Twitch name, or for YouTube @handle / UC id / v=VIDEOID")
+    ap.add_argument("--platform", default="twitch", choices=["twitch", "youtube"])
     ap.add_argument("--local", help="folder for clips (local mode, no database)")
     ap.add_argument("--max-hours", type=float, default=4.0)
     ap.add_argument("--settings", default="{}", help='JSON, e.g. {"layout":"stack","facecam":"top-left"}')
@@ -332,14 +382,15 @@ def main(argv=None) -> int:
                 return 0
             if os.environ.get("GITHUB_ACTIONS") == "true":
                 print(f"::add-mask::{w['channel']}", flush=True)     # Actions logs of a public repo are public
-            watcher = Watcher(store, w["channel"], settings, float(w["max_hours"]), work, handoff_after=a.handoff_after)
+            watcher = Watcher(store, w["channel"], settings, float(w["max_hours"]), work, handoff_after=a.handoff_after,
+                              platform=w.get("platform") or "twitch")
         else:
             if not (a.channel and a.local):
                 ap.error("use --watch ID, or --channel NAME --local FOLDER")
             settings = json.loads(a.settings)
             store = LocalStore(a.local, a.channel, settings, a.max_hours)
             watcher = Watcher(store, a.channel, settings, a.max_hours, work, source_file=a.source_file,
-                              chat_replay=a.chat_replay, handoff_after=a.handoff_after)
+                              chat_replay=a.chat_replay, handoff_after=a.handoff_after, platform=a.platform)
         try:
             watcher.run()
         except Exception as e:

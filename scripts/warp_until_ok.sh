@@ -4,7 +4,7 @@
 #
 #   scripts/warp_until_ok.sh <youtube url> [tries=8]
 #
-# On success: exports WARP_SOCKS (and WARP_TRIES) to $GITHUB_ENV and exits 0. On failure: no WARP_SOCKS, exit 1.
+# On success: prints WARP_SOCKS=..., exports WARP_SOCKS (and WARP_TRIES) to $GITHUB_ENV and exits 0. On failure: no WARP_SOCKS, exit 1.
 # Needs GH_TOKEN (to look up the release downloads) and yt-dlp + node installed.
 set -uo pipefail
 URL="$1"; TRIES="${2:-8}"; PORT=1080
@@ -26,9 +26,10 @@ for i in $(seq 1 "$TRIES"); do
   if [ -z "$colo" ]; then echo "try $i: tunnel did not answer"; continue; fi
   out=$(timeout 60 yt-dlp --no-warnings --proxy "socks5h://127.0.0.1:$PORT" --js-runtimes node --remote-components ejs:github \
         --skip-download --print "%(is_live)s %(id)s" "$URL" 2>&1 | tail -1)
-  if echo "$out" | grep -qE '^(True|False) '; then
+  if echo "$out" | grep -qE '^(True|False|None|NA) [A-Za-z0-9_-]{11}$'; then
     echo "try $i: YouTube accepted this WARP address (colo $colo): $out"
     { echo "WARP_SOCKS=socks5h://127.0.0.1:$PORT"; echo "WARP_TRIES=$i"; } >> "${GITHUB_ENV:-/dev/null}"
+    echo "WARP_SOCKS=socks5h://127.0.0.1:$PORT"
     exit 0
   fi
   echo "try $i: blocked (colo $colo): $(echo "$out" | cut -c1-110)"

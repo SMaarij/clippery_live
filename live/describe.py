@@ -29,8 +29,8 @@ def _clip(text: str, limit: int) -> str:
     return cut + "…"
 
 
-def _tags(channel: str, note: str) -> str:
-    tags = ["#shorts", "#twitch"]
+def _tags(channel: str, note: str, platform: str = "Twitch") -> str:
+    tags = ["#shorts", "#" + platform.lower()]
     if re.search(r"gta\s*(6|vi)", note or "", re.I):
         tags.append("#gta6")
     elif note:
@@ -43,20 +43,20 @@ def _tags(channel: str, note: str) -> str:
     return " ".join(tags[:4])
 
 
-def fallback(transcript: str, channel: str, note: str = "") -> dict:
+def fallback(transcript: str, channel: str, note: str = "", platform: str = "Twitch") -> dict:
     """No-LLM text: first sentence of what was said, or a plain line about the moment."""
     said = (transcript or "").strip()
     first = re.split(r"(?<=[.!?])\s+", said)[0] if said else ""
     hook = _clip(first, MAX_HOOK) if first else "Chat went wild here"
     title = _clip(f"{channel}: {first}" if first else f"{channel} {note or 'live'} moment chat couldn't believe", MAX_TITLE)
-    tags = _tags(channel, note)
+    tags = _tags(channel, note, platform)
     body = _clip(f"{channel} live{(' (' + note + ')') if note else ''}: {first or 'the moment chat exploded.'}", MAX_DESC - len(tags) - 1)
     return {"title": title, "hook": hook, "description": f"{body} {tags}", "source": "fallback"}
 
 
-def _prompt(transcript: str, chat_lines: list[str], channel: str, note: str) -> str:
+def _prompt(transcript: str, chat_lines: list[str], channel: str, note: str, platform: str = "Twitch") -> str:
     chat = "\n".join(f"- {c}" for c in chat_lines[:40]) or "(no chat captured)"
-    return f"""You write upload text for a short vertical clip cut from a Twitch livestream.
+    return f"""You write upload text for a short vertical clip cut from a {platform} livestream.
 
 Streamer: {channel}
 Stream note: {note or "(none)"}
@@ -75,14 +75,14 @@ Return ONE JSON object with:
 Do not use em dashes or en dashes. Do not invent events that are not supported by the speech or chat. Do not quote slurs or insults from chat. Return ONLY the JSON object."""
 
 
-def describe(transcript: str, chat_lines: list[str], channel: str, note: str = "", log=print) -> dict:
+def describe(transcript: str, chat_lines: list[str], channel: str, note: str = "", log=print, platform: str = "Twitch") -> dict:
     key = os.environ.get("GROQ_API_KEY")
     if not key:
-        return fallback(transcript, channel, note)
+        return fallback(transcript, channel, note, platform)
     try:
         import requests
         body = {"model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
-                "messages": [{"role": "user", "content": _prompt(transcript, chat_lines, channel, note)}],
+                "messages": [{"role": "user", "content": _prompt(transcript, chat_lines, channel, note, platform)}],
                 "response_format": {"type": "json_object"}, "temperature": 0.7, "max_completion_tokens": 1200}
         data = None
         for i in range(3):
@@ -95,14 +95,14 @@ def describe(transcript: str, chat_lines: list[str], channel: str, note: str = "
             break
         if not isinstance(data, dict):
             raise RuntimeError("no answer")
-        base = fallback(transcript, channel, note)
+        base = fallback(transcript, channel, note, platform)
         out = {"title": _clip(data.get("title") or base["title"], MAX_TITLE),
                "hook": _clip(data.get("hook") or data.get("hook_text") or base["hook"], MAX_HOOK),
                "description": _clip(data.get("description") or base["description"], MAX_DESC + 40),
                "source": "groq"}
         if "#" not in out["description"]:
-            out["description"] = _clip(out["description"], MAX_DESC - 30) + " " + _tags(channel, note)
+            out["description"] = _clip(out["description"], MAX_DESC - 30) + " " + _tags(channel, note, platform)
         return out
     except Exception as e:
         log(f"[describe] Groq failed ({str(e)[:160]}); using plain text")
-        return fallback(transcript, channel, note)
+        return fallback(transcript, channel, note, platform)

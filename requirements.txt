@@ -1,5 +1,6 @@
 streamlink>=7.0
 faster-whisper
-requests
+requests[socks]
+yt-dlp[default]
 supabase>=2.20
 boto3
