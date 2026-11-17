@@ -66,6 +66,8 @@ def main():
             fmts = [f for f in info.get("formats") or [] if f.get("vcodec") not in (None, "none")]
             ok = bool(fmts)
             say(f"{'OK  ' if ok else 'NONE'} {label}: live={info.get('is_live')} video formats={len(fmts)} ({time.time()-t:.0f}s)")
+            if ok:
+                say("  formats: " + ", ".join(f"{f.get('format_id')}:{f.get('height')}p/{f.get('protocol')}/{'a+v' if f.get('acodec') not in (None, 'none') else 'v'}" for f in fmts)[:300])
             if ok and not win:
                 win = (label, proxy, cookies, clients, info)
                 break
@@ -79,7 +81,7 @@ def main():
         say(f"RESULT: '{label}' opens the stream: {info.get('title', '')[:60]}")
         # record 25 s through the same route
         o = opts(proxy, cookies, clients)
-        o.update({"skip_download": False, "format": "best[height<=720]/best", "outtmpl": "rec.%(ext)s",
+        o.update({"skip_download": False, "format": "b[height<=720]/bv*[height<=720]+ba/b/bv*+ba", "outtmpl": "rec.%(ext)s",
                   "downloader": {"default": "ffmpeg"}, "external_downloader_args": {"ffmpeg_i": ["-t", "25"]}})
         t = time.time()
         try:
@@ -100,28 +102,25 @@ def main():
 
 
 def chat(proxy):
-    """Unofficial live chat (no API key) through the same route."""
-    env = dict(os.environ)
-    if proxy:
-        env["HTTPS_PROXY"] = env["HTTP_PROXY"] = env["ALL_PROXY"] = proxy
-    code = r"""
-import os, sys, time
-from chat_downloader import ChatDownloader
-n, t0, first = 0, time.time(), []
-try:
-    for m in ChatDownloader().get_chat(sys.argv[1], timeout=40):
-        n += 1
-        if len(first) < 3: first.append((m.get("message") or "")[:40])
-        if time.time() - t0 > 40: break
-except Exception as e:
-    print("error", type(e).__name__, str(e)[:160])
-print(f"{n} messages in {time.time()-t0:.0f}s, e.g. {first}")
-"""
+    """Our own innertube chat reader (live/youtube_chat.py) through the same route, for 40 s."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import yt_dlp
+    from live.youtube_chat import YouTubeChat
     try:
-        p = subprocess.run([sys.executable, "-c", code, URL], capture_output=True, text=True, timeout=75, env=env)
-        say(f"chat ({'proxy' if proxy else 'direct'}): {(p.stdout or p.stderr).strip().splitlines()[-1][:220] if (p.stdout or p.stderr).strip() else 'no output'}")
-    except subprocess.TimeoutExpired:
-        say("chat: timed out")
+        with yt_dlp.YoutubeDL({**opts(proxy, COOKIES, None), "extract_flat": False}) as y:
+            vid = y.extract_info(URL, download=False, process=False).get("id")
+    except Exception as e:
+        vid = None
+        say(f"chat: couldn't resolve the video id ({str(e)[:120]})")
+    if not vid:
+        return
+    got = []
+    c = YouTubeChat(vid, got.append, proxy=proxy, log=lambda m: say("  " + m))
+    c.start()
+    time.sleep(60)
+    c.stop()
+    users = len({m.user for m in got})
+    say(f"chat ({'proxy' if proxy else 'direct'}): {len(got)} messages from {users} people in 60s, e.g. {[m.text[:30] for m in got[:3]]}")
 
 
 if __name__ == "__main__":
