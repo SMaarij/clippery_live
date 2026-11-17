@@ -1,5 +1,7 @@
-# One-off check: can a GitHub runner record a YouTube live stream and read its chat, or does YouTube block
-# datacenter IPs ("Sign in to confirm you're not a bot")? Nothing is uploaded; it only prints what worked.
+# One-off check: which route lets a GitHub runner open, record and read the chat of a YouTube live stream?
+# Same toolkit as the ClipperyAI website worker: Node (yt-dlp's JS challenge solver), a free Cloudflare WARP
+# tunnel (wgcf + wireproxy as a local SOCKS proxy), the bgutil PO-token helper, and optional cookies
+# (repo secret YTDLP_COOKIES_B64). Nothing is uploaded; it prints a report (also in the run summary).
 name: youtube-test
 
 on:
@@ -17,56 +19,48 @@ jobs:
   test:
     if: github.repository == 'SMaarij/clippery_live'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       URL: ${{ inputs.url }}
+      YTDLP_COOKIES_B64: ${{ secrets.YTDLP_COOKIES_B64 }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
-          pip install -q -U yt-dlp streamlink chat-downloader
-          yt-dlp --version; streamlink --version
-      - name: "1. yt-dlp: stream info"
+          pip install -q -U "yt-dlp[default]" chat-downloader "requests[socks]"
+      - name: Cloudflare WARP tunnel
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eo pipefail
+          asset() { curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$1/releases/latest" | grep browser_download_url | grep "$2" | head -1 | cut -d '"' -f4; }
+          curl -sSL "$(asset ViRb3/wgcf linux_amd64)" -o wgcf && chmod +x wgcf
+          ./wgcf register --accept-tos >/dev/null && ./wgcf generate >/dev/null
+          curl -sSL "$(asset windtf/wireproxy linux_amd64.tar.gz)" | tar xz wireproxy
+          cp wgcf-profile.conf wireproxy.conf
+          printf '\n[Socks5]\nBindAddress = 127.0.0.1:1080\n' >> wireproxy.conf
+          nohup ./wireproxy -c wireproxy.conf > wireproxy.log 2>&1 &
+          sleep 4
+          curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(colo|warp)='
+          echo "WARP_SOCKS=socks5h://127.0.0.1:1080" >> "$GITHUB_ENV"
+      - name: PO-token helper
         continue-on-error: true
         run: |
-          yt-dlp --no-warnings --skip-download --print "%(title)s | live=%(is_live)s | id=%(id)s" "$URL" 2>&1 | tail -5
-      - name: "2. yt-dlp: record 30 s"
-        continue-on-error: true
-        run: |
-          timeout 75 yt-dlp --no-warnings -f "best[height<=720]/best" --no-part \
-            --downloader ffmpeg --downloader-args "ffmpeg_i:-t 30" -o "ytdlp.%(ext)s" "$URL" 2>&1 | tail -8 || true
-          ls -la ytdlp.* 2>/dev/null || echo "no file"
-          f=$(ls ytdlp.* 2>/dev/null | head -1); [ -n "$f" ] && ffprobe -v error -show_entries format=duration:stream=width,height -of compact "$f"
-      - name: "3. streamlink: record 30 s"
-        continue-on-error: true
-        run: |
-          timeout 45 streamlink --stdout "$URL" 720p,best 2>sl.err | ffmpeg -loglevel error -y -i pipe:0 -t 30 -c copy sl.ts || true
-          tail -5 sl.err
-          ls -la sl.ts 2>/dev/null && ffprobe -v error -show_entries format=duration:stream=width,height -of compact sl.ts || echo "no file"
-      - name: "4. live chat (unofficial, no API key)"
-        continue-on-error: true
-        run: |
-          timeout 60 python - <<'EOF'
-          import os, time
-          from chat_downloader import ChatDownloader
-          n, t0 = 0, time.time()
-          try:
-              for m in ChatDownloader().get_chat(os.environ["URL"], timeout=45):
-                  n += 1
-                  if n <= 5:
-                      print("chat:", (m.get("message") or "")[:60])
-                  if n >= 300 or time.time() - t0 > 45:
-                      break
-          except Exception as e:
-              print("chat failed:", type(e).__name__, str(e)[:300])
-          print(f"chat messages read in {time.time()-t0:.0f}s: {n}")
-          EOF
-      - name: Summary
-        if: always()
-        run: |
-          echo "### YouTube from a GitHub runner" >> $GITHUB_STEP_SUMMARY
-          for f in ytdlp.mp4 ytdlp.webm ytdlp.mkv sl.ts; do [ -f $f ] && echo "- $f: $(du -h $f | cut -f1)" >> $GITHUB_STEP_SUMMARY; done
-          true
+          docker run -d --name bgutil --init --net=host ${WARP_SOCKS:+-e HTTPS_PROXY=$WARP_SOCKS -e ALL_PROXY=$WARP_SOCKS} brainicism/bgutil-ytdlp-pot-provider >/dev/null
+          pip install -q bgutil-ytdlp-pot-provider
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:4416/ping >/dev/null && break; sleep 2; done
+          if curl -s -m 60 -X POST http://127.0.0.1:4416/get_pot -H 'Content-Type: application/json' -d '{}' | grep -qi 'potoken\|po_token'; then
+            echo "POT_MINT=ok" >> "$GITHUB_ENV"; echo "mint ok"
+          else
+            pip uninstall -y -q bgutil-ytdlp-pot-provider; echo "POT_MINT=failed" >> "$GITHUB_ENV"; echo "mint failed"
+          fi
+      - name: Probe
+        run: python tests/yt_probe.py "$URL"
