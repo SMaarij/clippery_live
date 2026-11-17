@@ -80,30 +80,20 @@ def main():
     else:
         label, proxy, cookies, clients, info = win
         say(f"RESULT: '{label}' opens the stream: {info.get('title', '')[:60]}")
-        # record ~30 s through the same route: yt-dlp CLI, killed after 40 s; MPEG-TS so a cut-off file still plays
-        cmd = [sys.executable, "-m", "yt_dlp", "--no-warnings", "-f", "b[height<=720]/b", "--hls-use-mpegts", "--no-part",
-               "--js-runtimes", "node", "--remote-components", "ejs:github", "-o", "rec.ts", URL]
-        if proxy:
-            cmd[3:3] = ["--proxy", proxy]
-        if cookies:
-            cmd[3:3] = ["--cookies", cookies]
-        if clients:
-            cmd[3:3] = ["--extractor-args", "youtube:player_client=" + ",".join(clients)]
+        # record 25 s through the same route with streamlink (what the watcher records Twitch with) piped into ffmpeg
         t = time.time()
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        try:
-            out, _ = p.communicate(timeout=40)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
-        tail = " | ".join(l for l in (out or "").splitlines()[-3:])
-        files = [f for f in os.listdir(".") if f.startswith("rec.")]
-        if files:
-            pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=width,height",
-                                 "-of", "compact", files[0]], capture_output=True, text=True)
-            say(f"recorded {files[0]}: {os.path.getsize(files[0])//1024} KB in {time.time()-t:.0f}s | {pr.stdout.strip()[:160]}")
+        sl = ["streamlink", "--stdout", "--hls-live-edge", "2"] + (["--http-proxy", proxy] if proxy else []) + [URL, "720p,best"]
+        p1 = subprocess.Popen(sl, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p2 = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", "pipe:0", "-t", "25", "-c", "copy", "rec.ts"],
+                            stdin=p1.stdout, capture_output=True, text=True, timeout=90)
+        p1.kill()
+        err = (p1.stderr.read() or b"").decode("utf-8", "replace").strip().splitlines()[-2:]
+        if os.path.exists("rec.ts") and os.path.getsize("rec.ts") > 10000:
+            pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
+                                 "-of", "compact", "rec.ts"], capture_output=True, text=True)
+            say(f"recorded rec.ts with streamlink: {os.path.getsize('rec.ts')//1024} KB in {time.time()-t:.0f}s | {' '.join(pr.stdout.split())[:220]}")
         else:
-            say(f"recorded: nothing | {tail[:200]}")
+            say(f"streamlink recorded nothing | {' | '.join(err)[:200]} {p2.stderr[:120]}")
     chat(win[1] if win else WARP or None)
     with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as f:
         f.write("### YouTube from a GitHub runner\n```\n" + "\n".join(report) + "\n```\n")
