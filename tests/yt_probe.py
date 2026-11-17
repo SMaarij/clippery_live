@@ -79,23 +79,30 @@ def main():
     else:
         label, proxy, cookies, clients, info = win
         say(f"RESULT: '{label}' opens the stream: {info.get('title', '')[:60]}")
-        # record 25 s through the same route
-        o = opts(proxy, cookies, clients)
-        o.update({"skip_download": False, "format": "b[height<=720]/bv*[height<=720]+ba/b/bv*+ba", "outtmpl": "rec.%(ext)s",
-                  "downloader": {"default": "ffmpeg"}, "external_downloader_args": {"ffmpeg_i": ["-t", "25"]}})
+        # record ~30 s through the same route: yt-dlp CLI, killed after 40 s; MPEG-TS so a cut-off file still plays
+        cmd = [sys.executable, "-m", "yt_dlp", "--no-warnings", "-f", "b[height<=720]/b", "--hls-use-mpegts", "--no-part",
+               "--js-runtimes", "node", "--remote-components", "ejs:github", "-o", "rec.ts", URL]
+        if proxy:
+            cmd[3:3] = ["--proxy", proxy]
+        if cookies:
+            cmd[3:3] = ["--cookies", cookies]
+        if clients:
+            cmd[3:3] = ["--extractor-args", "youtube:player_client=" + ",".join(clients)]
         t = time.time()
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:
-            with yt_dlp.YoutubeDL(o) as y:
-                y.download([URL])
-        except Exception as e:
-            say(f"record error: {str(e)[:200]}")
+            out, _ = p.communicate(timeout=40)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+        tail = " | ".join(l for l in (out or "").splitlines()[-3:])
         files = [f for f in os.listdir(".") if f.startswith("rec.")]
         if files:
-            p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=width,height",
-                                "-of", "compact", files[0]], capture_output=True, text=True)
-            say(f"recorded {files[0]}: {os.path.getsize(files[0])//1024} KB in {time.time()-t:.0f}s | {p.stdout.strip()[:160]}")
+            pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=width,height",
+                                 "-of", "compact", files[0]], capture_output=True, text=True)
+            say(f"recorded {files[0]}: {os.path.getsize(files[0])//1024} KB in {time.time()-t:.0f}s | {pr.stdout.strip()[:160]}")
         else:
-            say("recorded: nothing")
+            say(f"recorded: nothing | {tail[:200]}")
     chat(win[1] if win else WARP or None)
     with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as f:
         f.write("### YouTube from a GitHub runner\n```\n" + "\n".join(report) + "\n```\n")
