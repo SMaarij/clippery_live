@@ -16,6 +16,7 @@ the same table; a database function drops the duplicate clip if both catch the s
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import json
 import os
@@ -35,6 +36,7 @@ if ROOT not in sys.path:
 from live.buffer import SegmentBuffer          # noqa: E402
 from live.chat import ChatMessage, TwitchChat  # noqa: E402
 from live.clipper import make_clip             # noqa: E402
+from live.describe import describe             # noqa: E402
 from live.detector import SpikeDetector        # noqa: E402
 from live.recorder import Recorder, is_live    # noqa: E402
 from live.store import DbStore, LocalStore     # noqa: E402
@@ -85,6 +87,8 @@ class Watcher:
         self.jobs: queue.Queue = queue.Queue()
         self.made, self.failed, self.n = 0, 0, 0
         self.chat_lock = threading.Lock()
+        self.recent_chat: collections.deque = collections.deque(maxlen=4000)
+        self.note = ""
         self.recorder: Recorder | None = None
         self.buffer: SegmentBuffer | None = None
         self.session = 0
@@ -96,6 +100,7 @@ class Watcher:
     def on_chat(self, m: ChatMessage) -> None:
         with self.chat_lock:
             self.detector.add(m.ts, m.user, m.text)
+            self.recent_chat.append((m.ts, m.text))
 
     def _replay_chat(self, path: str, t0: float) -> None:
         with open(path, encoding="utf-8") as f:
@@ -128,8 +133,10 @@ class Watcher:
                                 stream_ended=recorder.ended.is_set, log=log)
                 when = dt.datetime.utcfromtimestamp(moment).strftime("%H:%M UTC")
                 label = "viewer clip" if trigger == "viewer_clip" else f"chat spike {score}x"
-                title = f"{self.channel} {when} ({label})"
-                cid = self.store.add_clip(res, moment, trigger, score, title)
+                text = describe(res.transcript or "", self._chat_near(moment), self.channel, self.note, log=log)
+                title = text.get("title") or f"{self.channel} {when} ({label})"
+                cid = self.store.add_clip(res, moment, trigger, score, title, hook=text.get("hook"),
+                                          description=text.get("description"))
                 if cid:
                     self.made += 1
                     log(f"[clip] saved {name} -> {cid} ({res.duration}s, {label})")
@@ -144,6 +151,13 @@ class Watcher:
                 log(f"[clip] {name} failed: {str(e)[:300]}")
             finally:
                 self.jobs.task_done()
+
+    def _chat_near(self, moment: float, before: float = 15, after: float = 10) -> list[str]:
+        """Distinct chat lines typed around the moment (what made chat spike), most repeated first."""
+        with self.chat_lock:
+            lines = [t.strip() for ts, t in self.recent_chat if moment - before <= ts <= moment + after and t.strip()]
+        counts = collections.Counter(lines)
+        return [f"{t} (x{n})" if n > 1 else t for t, n in counts.most_common(40)]
 
     def _queue_clip(self, moment: float, trigger: str, score: float | None) -> None:
         if self.made + self.jobs.qsize() >= int(self.settings["max_clips"]):
@@ -183,6 +197,7 @@ class Watcher:
     def run(self) -> str:
         t_start = self.clock()
         watch = self.store.load()
+        self.note = (watch.get("note") or "").strip()
         self.my_generation = int(watch.get("generation") or 0) + 1
         hb = [t_start]
         if int(watch.get("generation") or 0) == 0:                # a hand-over run must not overwrite the live run's status
@@ -213,7 +228,7 @@ class Watcher:
             self.store.update(generation=self.my_generation, active_run=self.run_id, status="recording")
         self.recorder.started.wait(timeout=90)
         log(f"[watch] recording {self.channel} (run {self.run_id}, generation {self.my_generation})")
-        last_check, last_viewer = 0.0, self.clock()
+        last_check, last_viewer, last_purge = 0.0, self.clock(), 0.0
         drop_checks = 0
         try:
             while True:
@@ -246,6 +261,15 @@ class Watcher:
                         break
                     if claimed:
                         self._heartbeat("recording", hb)
+                    if claimed and isinstance(self.store, DbStore) and now - last_purge >= 600:
+                        last_purge = now                  # clips expire after LIVE_RETENTION_HOURS even mid-stream
+                        try:
+                            from live import cleanup
+                            n = cleanup.purge_clips(self.store.db)
+                            if n:
+                                log(f"[cleanup] deleted {n} expired clips")
+                        except Exception as e:
+                            log(f"[cleanup] {str(e)[:200]}")
                     if (not self.handed_off and os.environ.get("GITHUB_ACTIONS") == "true"
                             and now - t_start >= self.handoff_after):
                         self.handed_off = dispatch_next_run(self.store.watch_id)

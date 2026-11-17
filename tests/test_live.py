@@ -147,6 +147,38 @@ def test_buffer_prune():
         check("window() returns the segments covering a time range", 2 <= len(segs) <= 4, len(segs))
 
 
+def test_describe():
+    from unittest import mock
+    from live import describe as d
+    with mock.patch.dict(os.environ, {"GROQ_API_KEY": ""}):
+        fb = d.describe("No way he jumped the bridge. That was insane!", [], "caseoh_", "GTA 6")
+    check("without Groq: plain title/hook/description from the transcript",
+          fb["source"] == "fallback" and "No way he jumped the bridge" in fb["hook"] and "#gta6" in fb["description"]
+          and len(fb["title"]) <= 100 and len(fb["description"]) <= 200, fb)
+    empty = d.fallback("", "summit1g")
+    check("without speech: still gives usable text", empty["hook"] and "#" in empty["description"], empty)
+
+    class R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"choices": [{"message": {"content": json.dumps({"hook": "He actually made it", "title": "x" * 300,
+                                                                     "description": "Chat lost it when he cleared the jump."})}}]}
+    with mock.patch.dict(os.environ, {"GROQ_API_KEY": "test"}), mock.patch("requests.post", return_value=R()) as post:
+        out = d.describe("he made it", ["LMAO (x30)", "NO WAY"], "caseoh_", "GTA 6")
+    sent = post.call_args.kwargs["json"]["messages"][0]["content"]
+    check("Groq answer is used, trimmed to the limits, and hashtags are added if missing",
+          out["source"] == "groq" and out["hook"] == "He actually made it" and len(out["title"]) <= 100 and "#" in out["description"], out)
+    check("the prompt includes what chat was typing", "LMAO (x30)" in sent and "GTA 6" in sent)
+
+    import live.watcher as wmod
+    w = wmod.Watcher(store=type("S", (), {"watch_id": "t"})(), channel="x", settings={}, max_hours=1, workdir=".")
+    for i, t in enumerate(["LUL", "LUL", "wow", "old message"]):
+        w.on_chat(wmod.ChatMessage(ts=100.0 if t != "old message" else 10.0, user=f"u{i}", text=t))
+    near = w._chat_near(100.0)
+    check("chat around the moment is collected, most repeated first", near[0] == "LUL (x2)" and "old message" not in near, near)
+
+
 def offline_run():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
@@ -190,6 +222,8 @@ def offline_run():
             check("offline run: clip length is within the limits", 10 <= dur <= 60, dur)
             check("offline run: captions (.srt) and thumbnail were written", c.get("srt") and os.path.getsize(c["srt"]) > 20
                   and c.get("thumb") and os.path.exists(c["thumb"]), c)
+            check("offline run: clip has a title, hook and a description ending in hashtags",
+                  c.get("title") and c.get("hook") and "#" in (c.get("description") or ""), {k: c.get(k) for k in ("title", "hook", "description")})
             check("offline run: the untouched 16:9 source window is kept too", c.get("raw") and clipper.probe(c["raw"])[:2] == (1280, 720))
 
 
@@ -243,6 +277,7 @@ def main():
     test_refine_and_captions()
     test_stack_geometry()
     test_buffer_prune()
+    test_describe()
     if "--quick" not in sys.argv:
         offline_run()
         offline_handoff()

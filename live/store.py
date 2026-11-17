@@ -39,7 +39,8 @@ class LocalStore:
     def generation_owner(self) -> tuple[int, str | None]:
         return self.watch.get("generation", 0), self.watch.get("active_run")
 
-    def add_clip(self, clip, moment: float, trigger: str, score: float | None, title: str) -> str | None:
+    def add_clip(self, clip, moment: float, trigger: str, score: float | None, title: str,
+                 hook: str | None = None, description: str | None = None) -> str | None:
         if any(abs(c["moment"] - moment) < 20 for c in self.clips):
             return None
         cid = uuid.uuid4().hex[:10]
@@ -50,7 +51,8 @@ class LocalStore:
                 shutil.copyfile(path, target)
                 dst[key] = target
         row = {"id": cid, "moment": moment, "moment_at": iso(moment), "duration": clip.duration, "trigger": trigger,
-               "score": score, "title": title, "transcript": clip.transcript, **dst}
+               "score": score, "title": title, "hook": hook, "description": description,
+               "transcript": clip.transcript, **dst}
         self.clips.append(row)
         with open(self.index, "w", encoding="utf-8") as f:
             json.dump(self.clips, f, indent=2)
@@ -84,7 +86,8 @@ class DbStore:
         rows = self.db.table("live_watches").select("generation,active_run").eq("id", self.watch_id).limit(1).execute().data
         return (rows[0]["generation"], rows[0]["active_run"]) if rows else (0, None)
 
-    def add_clip(self, clip, moment: float, trigger: str, score: float | None, title: str) -> str | None:
+    def add_clip(self, clip, moment: float, trigger: str, score: float | None, title: str,
+                 hook: str | None = None, description: str | None = None) -> str | None:
         cid = uuid.uuid4().hex
         base = f"live/{self.watch_id}/{dt.datetime.utcfromtimestamp(moment):%Y%m%d-%H%M%S}-{cid[:8]}"
         uploads = [(base + ".mp4", clip.video, "video/mp4")]
@@ -104,4 +107,9 @@ class DbStore:
         })
         if not new_id:                                    # another runner already saved this moment
             self.cloud.remove([k for k, _, _ in uploads])
+        elif hook or description:
+            try:                                          # columns from the 20261117010000 migration
+                self.db.table("live_clips").update({"hook": hook, "description": description}).eq("id", new_id).execute()
+            except Exception as e:
+                print(f"[store] couldn't save hook/description (run the live_clip_text migration?): {str(e)[:160]}")
         return new_id

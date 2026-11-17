@@ -1,19 +1,24 @@
-# Daily: delete live clips older than LIVE_RETENTION_DAYS (repo variable, default 30) from R2 and the database.
+# Every 15 minutes: delete live clips older than LIVE_RETENTION_HOURS (repo variable, default 3) from R2 and the
+# database. Running watchers also purge every 10 minutes, so clips go on time even when GitHub delays this schedule.
 name: cleanup
 
 on:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: live-cleanup
+  cancel-in-progress: false
+
 jobs:
   cleanup:
     if: github.repository == 'SMaarij/clippery_live'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
@@ -21,7 +26,8 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_UPLOADS: ${{ secrets.R2_BUCKET_UPLOADS }}
-      LIVE_RETENTION_DAYS: ${{ vars.LIVE_RETENTION_DAYS || '30' }}
+      LIVE_RETENTION_HOURS: ${{ vars.LIVE_RETENTION_HOURS || '3' }}
+      LIVE_WATCH_RETENTION_DAYS: ${{ vars.LIVE_WATCH_RETENTION_DAYS || '30' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

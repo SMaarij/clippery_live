@@ -1,0 +1,72 @@
+# One-off check: can a GitHub runner record a YouTube live stream and read its chat, or does YouTube block
+# datacenter IPs ("Sign in to confirm you're not a bot")? Nothing is uploaded; it only prints what worked.
+name: youtube-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "YouTube live URL (a channel's /live page or a watch link)"
+        required: true
+        default: "https://www.youtube.com/@LofiGirl/live"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.repository == 'SMaarij/clippery_live'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      URL: ${{ inputs.url }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          pip install -q -U yt-dlp streamlink chat-downloader
+          yt-dlp --version; streamlink --version
+      - name: "1. yt-dlp: stream info"
+        continue-on-error: true
+        run: |
+          yt-dlp --no-warnings --skip-download --print "%(title)s | live=%(is_live)s | id=%(id)s" "$URL" 2>&1 | tail -5
+      - name: "2. yt-dlp: record 30 s"
+        continue-on-error: true
+        run: |
+          timeout 75 yt-dlp --no-warnings -f "best[height<=720]/best" --no-part \
+            --downloader ffmpeg --downloader-args "ffmpeg_i:-t 30" -o "ytdlp.%(ext)s" "$URL" 2>&1 | tail -8 || true
+          ls -la ytdlp.* 2>/dev/null || echo "no file"
+          f=$(ls ytdlp.* 2>/dev/null | head -1); [ -n "$f" ] && ffprobe -v error -show_entries format=duration:stream=width,height -of compact "$f"
+      - name: "3. streamlink: record 30 s"
+        continue-on-error: true
+        run: |
+          timeout 45 streamlink --stdout "$URL" 720p,best 2>sl.err | ffmpeg -loglevel error -y -i pipe:0 -t 30 -c copy sl.ts || true
+          tail -5 sl.err
+          ls -la sl.ts 2>/dev/null && ffprobe -v error -show_entries format=duration:stream=width,height -of compact sl.ts || echo "no file"
+      - name: "4. live chat (unofficial, no API key)"
+        continue-on-error: true
+        run: |
+          timeout 60 python - <<'EOF'
+          import os, time
+          from chat_downloader import ChatDownloader
+          n, t0 = 0, time.time()
+          try:
+              for m in ChatDownloader().get_chat(os.environ["URL"], timeout=45):
+                  n += 1
+                  if n <= 5:
+                      print("chat:", (m.get("message") or "")[:60])
+                  if n >= 300 or time.time() - t0 > 45:
+                      break
+          except Exception as e:
+              print("chat failed:", type(e).__name__, str(e)[:300])
+          print(f"chat messages read in {time.time()-t0:.0f}s: {n}")
+          EOF
+      - name: Summary
+        if: always()
+        run: |
+          echo "### YouTube from a GitHub runner" >> $GITHUB_STEP_SUMMARY
+          for f in ytdlp.mp4 ytdlp.webm ytdlp.mkv sl.ts; do [ -f $f ] && echo "- $f: $(du -h $f | cut -f1)" >> $GITHUB_STEP_SUMMARY; done
+          true

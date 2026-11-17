@@ -27,7 +27,9 @@ Twitch chat (anonymous IRC) --> spike detector --> moment --> cut from buffer --
   mid-word. 12-60 s long.
 * **Layouts.** `center` (middle of the frame) or `stack` (facecam corner on top, gameplay below, captions at the seam).
 * **Storage.** Clips go to the same Cloudflare R2 bucket as the ClipperyAI website (`live/` prefix) and are listed in
-  the `live_clips` table. `live/cleanup.py` deletes them after `LIVE_RETENTION_DAYS` (default 30), daily.
+  the `live_clips` table. `live/cleanup.py` deletes them after `LIVE_RETENTION_HOURS` (default 3): every 15 minutes from
+  `cleanup.yml`, and every 10 minutes from inside a running watcher. Each clip also gets an AI title, hook and
+  description (`live/describe.py`, Groq) like the website's clips.
 * **Long streams.** A GitHub run is capped at 6 h, so after ~5.4 h the run starts the next run for the same watch and
   keeps recording until the new one has warmed up and taken over. `live_add_clip` refuses a second clip within 20 s
   of one already saved, so the overlap never produces duplicates.
