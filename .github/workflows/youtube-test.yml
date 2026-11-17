@@ -11,6 +11,14 @@ on:
         description: "YouTube live URL (a channel's /live page or a watch link)"
         required: true
         default: "https://www.youtube.com/@LofiGirl/live"
+      watcher_minutes:
+        description: "0 = route probe only; N = also run the real watcher for N minutes on `channel`"
+        required: false
+        default: "0"
+      channel:
+        description: "channel for the watcher run (@handle, UC id or v=VIDEOID)"
+        required: false
+        default: "@LofiGirl"
 
 permissions:
   contents: read
@@ -52,4 +60,20 @@ jobs:
             pip uninstall -y -q bgutil-ytdlp-pot-provider; echo "POT_MINT=failed" >> "$GITHUB_ENV"; echo "mint failed"
           fi
       - name: Probe
+        if: inputs.watcher_minutes == '0'
         run: python tests/yt_probe.py "$URL"
+      - name: Real watcher, local mode (no database), a few minutes
+        if: inputs.watcher_minutes != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          pip install -q -r requirements.txt
+          pkill -f "wireproxy -c wireproxy.conf" || true; unset WARP_SOCKS     # the watcher brings up its own tunnel
+          CH="${{ inputs.channel }}"
+          echo "::add-mask::$CH"
+          timeout $(( ${{ inputs.watcher_minutes }} * 60 + 240 )) python -m live.watcher --platform youtube --channel "$CH" \
+            --local out --max-hours $(python -c "print(${{ inputs.watcher_minutes }}/60)") \
+            --settings '{"sensitivity":"high","wait_minutes":3}' || true
+          echo "--- result"
+          ls out 2>/dev/null | head; python -c "import json,os;p='out/clips.json';c=json.load(open(p)) if os.path.exists(p) else [];print(len(c),'clips',[{k:x.get(k) for k in ('duration','title','hook')} for x in c][:3])"
