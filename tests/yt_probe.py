@@ -55,6 +55,7 @@ def attempts():
 
 def main():
     import yt_dlp
+    say(f"WARP tries until accepted: {os.environ.get('WARP_TRIES', '-')}")
     say(f"routes available: warp={'yes' if WARP else 'no'} cookies={'yes' if COOKIES else 'no'} "
         f"po-token={os.environ.get('POT_MINT', 'n/a')} yt-dlp={yt_dlp.version.__version__}")
     win = None

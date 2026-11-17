@@ -35,22 +35,11 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
           pip install -q -U "yt-dlp[default]" chat-downloader "requests[socks]"
-      - name: Cloudflare WARP tunnel
+      - name: Cloudflare WARP tunnel (new address until YouTube accepts one)
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eo pipefail
-          asset() { curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$1/releases/latest" | grep browser_download_url | grep "$2" | head -1 | cut -d '"' -f4; }
-          curl -sSL "$(asset ViRb3/wgcf linux_amd64)" -o wgcf && chmod +x wgcf
-          ./wgcf register --accept-tos >/dev/null && ./wgcf generate >/dev/null
-          curl -sSL "$(asset windtf/wireproxy linux_amd64.tar.gz)" | tar xz wireproxy
-          cp wgcf-profile.conf wireproxy.conf
-          printf '\n[Socks5]\nBindAddress = 127.0.0.1:1080\n' >> wireproxy.conf
-          nohup ./wireproxy -c wireproxy.conf > wireproxy.log 2>&1 &
-          sleep 4
-          curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(colo|warp)='
-          echo "WARP_SOCKS=socks5h://127.0.0.1:1080" >> "$GITHUB_ENV"
+        run: bash scripts/warp_until_ok.sh "$URL" 8
       - name: PO-token helper
         continue-on-error: true
         run: |
