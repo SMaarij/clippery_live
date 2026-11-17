@@ -71,7 +71,6 @@ def main():
                 say("  formats: " + ", ".join(f"{f.get('format_id')}:{f.get('height')}p/{f.get('protocol')}/{'a+v' if f.get('acodec') not in (None, 'none') else 'v'}" for f in fmts)[:300])
             if ok and not win:
                 win = (label, proxy, cookies, clients, info)
-                break
         except Exception as e:
             msg = str(e).replace("\n", " ")
             say(f"FAIL {label}: {msg[msg.find(':', 10)+1:][:140].strip()} ({time.time()-t:.0f}s)")
